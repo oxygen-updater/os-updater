@@ -138,6 +138,11 @@ This can be useful if you want to:"</string>
 	<string name="settings_ad_privacy">GDPR ad consent</string>
 	<string name="settings_ad_privacy_subtitle">"For EEA/UK users"</string>
 	<string name="settings_clear_cache">Clear cache</string>
+	<string name="settings_download_connections">Download connections</string>
+	<string name="settings_download_connections_auto">Automatic</string>
+	<string name="settings_download_connections_auto_subtitle">4 on unmetered Wi-Fi, 2 on mobile data or metered Wi-Fi, 1 in battery saver</string>
+	<string name="settings_download_connections_forced" translatable="false">%1$d</string>
+	<string name="settings_download_connections_caption">"OTA servers limit the speed of each connection, so the update ZIP is downloaded in parallel over several of them. Change this only to compare download speeds on your device; the effective speed is written to the app log at the end of every download."</string>
 
 	<!-- FAQ strings -->
 	<string name="faq">FAQ</string>

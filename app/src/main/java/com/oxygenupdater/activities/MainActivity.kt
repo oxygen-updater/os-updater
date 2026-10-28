@@ -923,7 +923,9 @@ class MainActivity : AppCompatActivity() {
             openAboutScreen = openAboutScreen,
             getPrefStr = viewModel::getPref,
             getPrefBool = viewModel::getPref,
+            getPrefInt = viewModel::getPref,
             persistBool = viewModel::persist,
+            persistInt = viewModel::persist,
         )
     }
 

@@ -13,6 +13,7 @@ import kotlinx.serialization.json.Json
 import okhttp3.Cache
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.logging.HttpLoggingInterceptor
 import okhttp3.logging.HttpLoggingInterceptor.Level
 import retrofit2.Retrofit
@@ -54,6 +55,10 @@ fun createDownloadApi() = Retrofit.Builder()
     .baseUrl(ApiBaseUrl).apply {
         client(
             OkHttpClient.Builder().apply {
+                // Chunks are downloaded in parallel to get around per-connection throttling (see DownloadWorker),
+                // which needs separate connections. HTTP/2 would multiplex all requests over a single one.
+                protocols(listOf(Protocol.HTTP_1_1))
+
                 // Use a network interceptor to log all requests, even intermediary ones like redirects
                 if (BuildConfig.DEBUG) addNetworkInterceptor(HttpLoggingInterceptor().setLevel(Level.BASIC)).build()
 

@@ -68,6 +68,7 @@ fun PreviewAppTheme(content: @Composable () -> Unit) {
 
 val PreviewGetPrefStr: (key: String, default: String) -> String = { _, default -> default }
 val PreviewGetPrefBool: (key: String, default: Boolean) -> Boolean = { _, default -> default }
+val PreviewGetPrefInt: (key: String, default: Int) -> Int = { _, default -> default }
 
 val PreviewWindowSize
     @OptIn(ExperimentalMaterial3WindowSizeClassApi::class)

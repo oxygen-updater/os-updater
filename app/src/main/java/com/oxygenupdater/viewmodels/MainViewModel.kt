@@ -50,6 +50,7 @@ import com.oxygenupdater.internal.settings.KeyAdvancedMode
 import com.oxygenupdater.internal.settings.KeyDevice
 import com.oxygenupdater.internal.settings.KeyDeviceId
 import com.oxygenupdater.internal.settings.KeyDownloadBytesDone
+import com.oxygenupdater.internal.settings.KeyDownloadChunks
 import com.oxygenupdater.internal.settings.KeyFlexibleAppUpdateIgnoreCount
 import com.oxygenupdater.internal.settings.KeyIgnoreIncorrectDeviceWarnings
 import com.oxygenupdater.internal.settings.KeyIgnoreNotificationPermissionSheet
@@ -299,7 +300,7 @@ class MainViewModel @Inject constructor(
         }
 
         logDebug(TAG, "Deleting any associated tracker preferences for downloaded file")
-        sharedPreferences.remove(KeyDownloadBytesDone)
+        sharedPreferences.remove(KeyDownloadBytesDone, KeyDownloadChunks)
         logDebug(TAG, "Deleting downloaded update file $filename")
 
         File(context.getExternalFilesDir(null), filename).run {
@@ -452,7 +453,9 @@ class MainViewModel @Inject constructor(
 
     fun getPref(key: String, default: String) = sharedPreferences[key, default]
     fun getPref(key: String, default: Boolean) = sharedPreferences[key, default]
+    fun getPref(key: String, default: Int) = sharedPreferences[key, default]
     fun persist(key: String, value: Boolean) = sharedPreferences.set(key, value)
+    fun persist(key: String, value: Int) = sharedPreferences.set(key, value)
 
     fun openEmail(context: Context) {
         val chosenDevice = sharedPreferences[KeyDevice, "<UNKNOWN>"]

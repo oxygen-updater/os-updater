@@ -29,6 +29,7 @@ import com.oxygenupdater.assertHasScrollAction
 import com.oxygenupdater.enums.PurchaseType
 import com.oxygenupdater.extensions.formatFileSize
 import com.oxygenupdater.get
+import com.oxygenupdater.internal.settings.KeyDownloadConnections
 import com.oxygenupdater.internal.settings.KeyShareAnalyticsAndLogs
 import com.oxygenupdater.repositories.BillingRepository.SkuState
 import com.oxygenupdater.ui.Theme
@@ -36,6 +37,7 @@ import com.oxygenupdater.ui.common.IconTextButtonTestTag
 import com.oxygenupdater.ui.currentLocale
 import com.oxygenupdater.ui.dialogs.BottomSheetTestTag
 import com.oxygenupdater.ui.dialogs.BottomSheet_ItemRowTestTag
+import com.oxygenupdater.ui.dialogs.DownloadConnectionOptions
 import com.oxygenupdater.ui.dialogs.Themes
 import com.oxygenupdater.ui.main.NavType
 import org.junit.Rule
@@ -82,7 +84,9 @@ class SettingsScreenTest : UsesSharedPreferencesTest() {
                 openAboutScreen = { trackCallback("openAboutScreen") },
                 getPrefStr = ::getPrefStr,
                 getPrefBool = ::getPrefBool,
+                getPrefInt = ::getPrefInt,
                 persistBool = ::persistBool,
+                persistInt = ::persistInt,
             )
         }
 
@@ -247,8 +251,29 @@ class SettingsScreenTest : UsesSharedPreferencesTest() {
             switch.assertIsOn()
         }
 
-        // Analytics switch
+        // Download connections (shown only once advanced mode is on, so children below shift by one)
         children[10].run {
+            assertHasTextExactly(R.string.settings_download_connections, R.string.settings_download_connections_auto)
+
+            assertAndPerformClick()
+            sheet.assertIsDisplayed()
+            rule.onAllNodesWithTag(BottomSheet_ItemRowTestTag).run {
+                assertCountEquals(DownloadConnectionOptions.size)
+                this[3].assertAndPerformClick() // 4 connections
+            }
+            ensureCallbackInvokedExactlyOnce("persistInt: $KeyDownloadConnections=${DownloadConnectionOptions[3]}")
+            sheet.assertIsNotDisplayed()
+            assertHasTextExactly(
+                R.string.settings_download_connections,
+                activity.getString(R.string.settings_download_connections_forced, 4),
+            )
+        }
+
+        // This new child pushed the last one out of view again
+        children.onLast().performScrollTo()
+
+        // Analytics switch
+        children[11].run {
             assertHasTextExactly(R.string.settings_upload_logs, R.string.summary_on)
             val switch = onChild().assertIsOn()
 
@@ -260,7 +285,7 @@ class SettingsScreenTest : UsesSharedPreferencesTest() {
         }
 
         // GDPR ad consent
-        children[11].run {
+        children[12].run {
             assertHasTextExactly(R.string.settings_ad_privacy, R.string.settings_ad_privacy_subtitle)
             assertHasClickAction()
             // Don't performClick because that'll leave the app, which will fail subsequent tests
@@ -269,7 +294,7 @@ class SettingsScreenTest : UsesSharedPreferencesTest() {
         // Clear cache (conditional test, depends on cache size)
         // This is disabled if disk cache size is 0, which should be the case for standalone
         // runs of this file, but not if it's part of a full test run (CI or managed device).
-        children[12].run {
+        children[13].run {
             val zeroBytesText = activity.formatFileSize(0)
             val text = fetchSemanticsNode().config.getOrNull(SemanticsProperties.Text)
 
@@ -288,24 +313,24 @@ class SettingsScreenTest : UsesSharedPreferencesTest() {
     }
 
     private fun aboutSection() {
-        children[13].assertHasTextExactly(R.string.preference_header_about)
+        children[14].assertHasTextExactly(R.string.preference_header_about)
 
         // Privacy policy
-        children[14].run {
+        children[15].run {
             assertHasTextExactly(R.string.label_privacy_policy, R.string.summary_privacy_policy)
             assertHasClickAction()
             // Don't performClick because that'll leave the app, which will fail subsequent tests
         }
 
         // Rate app
-        children[15].run {
+        children[16].run {
             assertHasTextExactly(R.string.label_rate_app, R.string.summary_rate_app)
             assertHasClickAction()
             // Don't performClick because that'll leave the app, which will fail subsequent tests
         }
 
         // App version
-        children[16].run {
+        children[17].run {
             assertHasTextExactly(R.string.app_name, "v${BuildConfig.VERSION_NAME}")
             assertAndPerformClick()
             ensureCallbackInvokedExactlyOnce("openAboutScreen")

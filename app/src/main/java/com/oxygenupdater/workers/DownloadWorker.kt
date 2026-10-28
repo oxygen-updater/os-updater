@@ -5,15 +5,21 @@ import android.app.Notification.CATEGORY_PROGRESS
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build.VERSION.SDK_INT
 import android.os.Build.VERSION_CODES
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
+import android.util.Log
 import androidx.compose.ui.util.fastCoerceAtLeast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationCompat.PRIORITY_LOW
 import androidx.core.content.ContextCompat
+import androidx.core.content.getSystemService
 import androidx.core.net.toUri
 import androidx.hilt.work.HiltWorker
 import androidx.work.CoroutineWorker
@@ -32,8 +38,11 @@ import com.oxygenupdater.extensions.set
 import com.oxygenupdater.extensions.showToast
 import com.oxygenupdater.internal.NotSet
 import com.oxygenupdater.internal.NotSetL
+import com.oxygenupdater.internal.settings.KeyAdvancedMode
 import com.oxygenupdater.internal.settings.KeyDeviceId
 import com.oxygenupdater.internal.settings.KeyDownloadBytesDone
+import com.oxygenupdater.internal.settings.KeyDownloadChunks
+import com.oxygenupdater.internal.settings.KeyDownloadConnections
 import com.oxygenupdater.internal.settings.KeyUpdateMethodId
 import com.oxygenupdater.models.TimeRemaining
 import com.oxygenupdater.repositories.ServerRepository
@@ -49,16 +58,20 @@ import com.oxygenupdater.utils.UpdateDataVersionFormatter
 import com.oxygenupdater.utils.isNetworkError
 import com.oxygenupdater.utils.logDebug
 import com.oxygenupdater.utils.logError
-import com.oxygenupdater.utils.logInfo
 import com.oxygenupdater.utils.logVerbose
 import com.oxygenupdater.utils.logWarning
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import okhttp3.ResponseBody
@@ -73,7 +86,9 @@ import java.net.HttpURLConnection
 import java.security.DigestInputStream
 import java.security.MessageDigest
 import java.security.NoSuchAlgorithmException
+import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 
 /**
@@ -236,6 +251,8 @@ class DownloadWorker @AssistedInject constructor(
      */
     private suspend fun trySetForeground(notification: Notification) = try {
         setForeground(foregroundInfo(notification))
+    } catch (e: CancellationException) {
+        throw e // progress publishing is cancelled whenever a download ends, that's not a failure
     } catch (e: Exception) {
         crashlytics.logError(TAG, "setForeground failed", e)
     }
@@ -255,26 +272,6 @@ class DownloadWorker @AssistedInject constructor(
 
         tempFile = File(context.getExternalFilesDir(null), updateData.filename)
         zipFile = File(Environment.getExternalStoragePublicDirectory(DirectoryRoot).absolutePath, updateData.filename)
-
-        var startingByte = sharedPreferences[KeyDownloadBytesDone, NotSetL]
-        var rangeHeader = if (startingByte != NotSetL) "bytes=$startingByte-" else null
-
-        if (startingByte != NotSetL) {
-            logDebug(TAG, "Looks like a resume operation. Adding $rangeHeader to the request")
-
-            if (tempFile.length() > startingByte) crashlytics.logWarning(
-                TAG,
-                "Partially downloaded ZIP size differs from skipped bytes (${tempFile.length()} vs $startingByte)."
-            ) else if (tempFile.length() < startingByte) {
-                crashlytics.logWarning(
-                    TAG,
-                    "Partially downloaded ZIP size (${tempFile.length()}) is lesser than skipped bytes ($startingByte). Resetting state."
-                )
-
-                startingByte = NotSetL
-                rangeHeader = null
-            }
-        }
 
         // Preemptively refresh a download URL if it's about to expire
         var downloadUrl = updateData.downloadUrl!!
@@ -303,19 +300,24 @@ class DownloadWorker @AssistedInject constructor(
         }
 
         while (true) {
-            val response = try {
-                downloadApi.downloadZip(downloadUrl, rangeHeader)
+            try {
+                downloadToTempFile(downloadUrl)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                val response = Response.error<ResponseBody>(
+                val response = (e as? HttpException)?.response() ?: Response.error<ResponseBody>(
                     // Use 418 I'm a teapot for our own 'default' error response.
                     // Note that the code must be >= 400, otherwise Retrofit will throw an error.
-                    if (refreshableLink) HttpURLConnection.HTTP_FORBIDDEN else 418,
+                    if (refreshableLink && e is DownloadRequestException) HttpURLConnection.HTTP_FORBIDDEN else 418,
                     ResponseBody.EMPTY,
                 )
-                val result = handleException(
+                val result = if (e is HttpException && !refreshableLink) {
+                    failureUnsuccessfulResponse(response, downloadUrl)
+                } else handleException(
                     response = response,
                     downloadUrl = downloadUrl,
-                    exception = e,
+                    // Unwrap so that `isNetworkError` can classify the actual cause
+                    exception = (e as? DownloadRequestException)?.cause as? Exception ?: e,
                 )
 
                 // This will only be set if the download URL was refreshed
@@ -323,106 +325,26 @@ class DownloadWorker @AssistedInject constructor(
                     ?: return@withContext result
                 if (newDownloadUrl.isBlank()) return@withContext failureNullUpdateDataOrDownloadUrl()
                 else {
-                    // Continue to the next iteration of the loop only if we're sure there's a new download URL to try
+                    // Continue to the next iteration of the loop only if we're sure there's a new download URL to try.
+                    // Chunks downloaded so far are kept, so only the remaining ones will be requested.
                     downloadUrl = newDownloadUrl
                     continue
-                }
-            }
-
-            fun failureUnsuccessfulResponse() = Result.failure(Data.Builder().apply {
-                putInt(WorkDataDownloadFailureType, DownloadFailure.UnsuccessfulResponse.value)
-                putString(WorkDataDownloadFailureExtraUrl, downloadUrl)
-                putString(WorkDataDownloadFailureExtraFilename, updateData.filename)
-                putString(WorkDataDownloadFailureExtraVersion, updateData.versionNumber)
-                putString(WorkDataDownloadFailureExtraOtaVersion, updateData.otaVersionNumber)
-                putInt(WorkDataDownloadFailureExtraHttpCode, response.code())
-                putString(WorkDataDownloadFailureExtraHttpMessage, response.message())
-            }.build())
-
-            if (!response.isSuccessful) {
-                if (!refreshableLink) return@withContext failureUnsuccessfulResponse()
-
-                val result = handleException(
-                    response = response,
-                    downloadUrl = downloadUrl,
-                    exception = HttpException(response),
-                )
-
-                // This will only be set if the download URL was refreshed
-                val newDownloadUrl = result.outputData.getString(NewDownloadUrlFailureFlag)
-                    ?: return@withContext result
-                if (newDownloadUrl.isBlank()) return@withContext failureNullUpdateDataOrDownloadUrl()
-                else {
-                    // Continue to the next iteration of the loop only if we're sure there's a new download URL to try
-                    downloadUrl = newDownloadUrl
-                    continue
-                }
-            }
-
-            val body = response.body() ?: return@withContext failureUnsuccessfulResponse()
-            body.byteStream().use { stream ->
-                logInfo(TAG, "Downloading ZIP from ${startingByte.fastCoerceAtLeast(0L)} bytes")
-
-                // Copy stream to file
-                // We could have used the [InputStream.copyTo] extension defined in [IOStreams.kt],
-                // but we need to support pause/resume functionality, as well as publish progress
-                RandomAccessFile(tempFile, "rw").use { randomAccessFile ->
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                    var bytes: Int
-                    var bytesRead = startingByte.fastCoerceAtLeast(0L)
-                    val contentLength = bytesRead + body.contentLength()
-
-                    if (abs(contentLength - updateData.downloadSize) > ThresholdBytesDifferenceWithBackend) {
-                        crashlytics.logWarning(
-                            TAG,
-                            "Content length reported by the download server differs from UpdateData.downloadSize ($contentLength vs ${updateData.downloadSize})"
-                        )
-                    }
-
-                    if (startingByte != NotSetL) {
-                        logDebug(TAG, "Looks like a resume operation. Seeking to $startingByte bytes")
-                        randomAccessFile.seek(startingByte)
-                    }
-
-                    try {
-                        while (stream.read(buffer).also { bytes = it } >= 0) {
-                            randomAccessFile.write(buffer, 0, bytes)
-                            bytesRead += bytes
-
-                            publishDownloadProgress(bytesDone = bytesRead, totalBytes = contentLength)
-                        }
-                    } catch (e: Exception) {
-                        val result = handleException(
-                            response = response,
-                            downloadUrl = downloadUrl,
-                            exception = e,
-                        )
-
-                        // This will only be set if the download URL was refreshed
-                        val newDownloadUrl = result.outputData.getString(NewDownloadUrlFailureFlag)
-                            ?: return@withContext result
-                        if (newDownloadUrl.isBlank()) return@withContext failureNullUpdateDataOrDownloadUrl()
-                        else {
-                            // Continue to the next iteration of the loop only if we're sure there's a new download URL to try
-                            downloadUrl = newDownloadUrl
-                            continue
-                        }
-                    }
-
-                    logDebug(TAG, "Download completed. Deleting any associated tracker preferences")
-                    sharedPreferences.remove(KeyDownloadBytesDone)
-
-                    setProgress(Data.Builder().apply {
-                        putLong(WorkDataDownloadBytesDone, contentLength)
-                        putLong(WorkDataDownloadTotalBytes, contentLength)
-                        putInt(WorkDataDownloadProgress, 100)
-                    }.build())
                 }
             }
 
             // If we reach here, download has completed successfully, so break out of the loop
             break
         }
+
+        logDebug(TAG, "Download completed. Deleting any associated tracker preferences")
+        sharedPreferences.remove(KeyDownloadBytesDone, KeyDownloadChunks)
+
+        val contentLength = tempFile.length()
+        setProgress(Data.Builder().apply {
+            putLong(WorkDataDownloadBytesDone, contentLength)
+            putLong(WorkDataDownloadTotalBytes, contentLength)
+            putInt(WorkDataDownloadProgress, 100)
+        }.build())
 
         // Copy file to root directory of internal storage
         // Note: this requires the storage permission to be granted
@@ -445,6 +367,197 @@ class DownloadWorker @AssistedInject constructor(
         publishVerificationProgress()
         verify()
     }
+
+    /**
+     * Downloads [url] into [tempFile] in parallel chunks (see [downloadChunks]), resuming from any
+     * previously saved progress. Falls back to a single stream if the server doesn't support range requests.
+     *
+     * @throws HttpException if the server responds with an error code
+     * @throws IOException on I/O errors
+     */
+    private suspend fun downloadToTempFile(url: String) = coroutineScope {
+        // Request just the first byte, to find out the file size and whether range requests are supported
+        val probe = wrapRequestErrors { downloadApi.downloadZip(url, "bytes=0-0") }
+        if (!probe.isSuccessful) {
+            probe.errorBody()?.close()
+            throw HttpException(probe)
+        }
+
+        val totalBytes = probe.totalBytesFromContentRange()
+        if (totalBytes == null) {
+            // Server ignored the Range header, so this response contains the entire file
+            val body = probe.body() ?: throw IOException("Empty body")
+            return@coroutineScope downloadSequentially(body)
+        }
+        probe.body()?.close()
+
+        if (updateData != null && abs(totalBytes - updateData.downloadSize) > ThresholdBytesDifferenceWithBackend) {
+            crashlytics.logWarning(
+                TAG,
+                "Content length reported by the download server differs from UpdateData.downloadSize ($totalBytes vs ${updateData.downloadSize})"
+            )
+        }
+
+        val saved = DownloadChunks.parse(sharedPreferences[KeyDownloadChunks, ""])
+        val chunks = if (saved != null && saved.totalBytes == totalBytes && tempFile.length() == totalBytes) {
+            logDebug(TAG, "Looks like a resume operation. ${saved.bytesDone()} of $totalBytes bytes already downloaded")
+            saved
+        } else {
+            if (saved != null) crashlytics.logWarning(
+                TAG,
+                "Saved progress doesn't match partially downloaded ZIP (${saved.totalBytes} vs ${tempFile.length()} vs $totalBytes). Resetting state."
+            )
+
+            sharedPreferences.remove(KeyDownloadBytesDone)
+            RandomAccessFile(tempFile, "rw").use { it.setLength(totalBytes) }
+            DownloadChunks.create(totalBytes)
+        }
+
+        val conditions = currentDownloadConditions()
+        val connections = downloadConnectionsFor(
+            transport = conditions.transport,
+            metered = conditions.metered,
+            powerSave = conditions.powerSave,
+            forced = conditions.forced,
+        )
+        logDownloadStats("Downloading ZIP in ${chunks.count} chunks over $connections connections ($conditions)")
+
+        val progress = launchProgressPublisher(totalBytes, chunks::bytesDone) {
+            sharedPreferences[KeyDownloadChunks] = chunks.serialize()
+        }
+
+        val bytesAtStart = chunks.bytesDone()
+        val startMs = SystemClock.elapsedRealtime()
+        var completed = false
+        try {
+            downloadChunks(tempFile, chunks, connections) { rangeHeader -> downloadApi.downloadZip(url, rangeHeader) }
+            completed = true
+        } finally {
+            progress.cancel()
+            // Save even on failure/cancellation, so that the download can be resumed later
+            sharedPreferences[KeyDownloadChunks] = chunks.serialize()
+            logThroughput(outcome(completed), chunks.bytesDone() - bytesAtStart, startMs, connections, conditions)
+        }
+    }
+
+    /** Fallback for servers that don't support range requests. Can't be resumed, so it always starts over. */
+    private suspend fun downloadSequentially(body: ResponseBody) = coroutineScope {
+        val conditions = currentDownloadConditions()
+        logDownloadStats("Downloading ZIP sequentially, server ignored Range ($conditions)")
+        sharedPreferences.remove(KeyDownloadBytesDone, KeyDownloadChunks)
+
+        val bytesDone = AtomicLong()
+        val progress = launchProgressPublisher(body.contentLength(), bytesDone::get)
+
+        val startMs = SystemClock.elapsedRealtime()
+        var completed = false
+        try {
+            body.byteStream().use { stream ->
+                tempFile.outputStream().use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    var bytes: Int
+                    while (stream.read(buffer).also { bytes = it } >= 0) {
+                        ensureActive()
+                        output.write(buffer, 0, bytes)
+                        bytesDone.addAndGet(bytes.toLong())
+                    }
+                }
+            }
+            completed = true
+        } finally {
+            progress.cancel()
+            logThroughput(outcome(completed), bytesDone.get(), startMs, connections = 1, conditions = conditions)
+        }
+    }
+
+    /** For [logThroughput]: how a download attempt ended. Must be called from the attempt's own scope. */
+    private fun CoroutineScope.outcome(completed: Boolean) = when {
+        completed -> "completed"
+        !isActive -> "cancelled"
+        else -> "interrupted" // an error, including a 403 that'll be retried with a fresh link
+    }
+
+    /** Everything [downloadConnectionsFor] bases its decision on, captured once per download attempt */
+    private data class DownloadConditions(
+        val transport: NetworkTransport,
+        val metered: Boolean,
+        val powerSave: Boolean,
+        val forced: Int,
+    ) {
+        override fun toString() = "transport=$transport, metered=$metered, powerSave=$powerSave, forced=" +
+                if (forced == DownloadConnectionsAuto) "auto" else forced.toString()
+    }
+
+    private fun currentDownloadConditions(): DownloadConditions {
+        val connectivityManager = context.getSystemService<ConnectivityManager>()
+        val capabilities = connectivityManager?.getNetworkCapabilities(connectivityManager.activeNetwork)
+        val transport = when {
+            capabilities == null -> NetworkTransport.Other
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                    || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> NetworkTransport.WifiOrEthernet
+
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> NetworkTransport.Cellular
+            else -> NetworkTransport.Other
+        }
+
+        return DownloadConditions(
+            transport = transport,
+            metered = connectivityManager?.isActiveNetworkMetered == true,
+            powerSave = context.getSystemService<PowerManager>()?.isPowerSaveMode == true,
+            // The setting is reachable only in advanced mode, so a value left behind after turning it off must not stick
+            forced = if (sharedPreferences[KeyAdvancedMode, false]) {
+                sharedPreferences[KeyDownloadConnections, DownloadConnectionsAuto]
+            } else DownloadConnectionsAuto,
+        )
+    }
+
+    /**
+     * One line per download attempt with the effective throughput, so that reports from testers carry numbers.
+     * Logged on every outcome (completed, failed, cancelled, link refreshed), for the bytes transferred in this attempt only.
+     */
+    private fun logThroughput(outcome: String, bytes: Long, startMs: Long, connections: Int, conditions: DownloadConditions) {
+        val seconds = (SystemClock.elapsedRealtime() - startMs) / 1000.0
+        val megabytes = bytes / 1e6
+        val megabytesPerSecond = if (seconds > 0) megabytes / seconds else 0.0
+        logDownloadStats(
+            "Download %s: %.1f MB in %.1f s = %.2f MB/s over %d connections (%s)".format(
+                Locale.ROOT, outcome, megabytes, seconds, megabytesPerSecond, connections, conditions
+            )
+        )
+    }
+
+    /**
+     * Unlike [com.oxygenupdater.utils.logInfo], this is not stripped from release builds: it's a couple of lines
+     * per download, and testers on release builds need them in logcat. Also breadcrumbed to Crashlytics so that
+     * reports carry them too.
+     */
+    private fun logDownloadStats(message: String) {
+        Log.i(TAG, message)
+        crashlytics.log(message)
+    }
+
+    /** Publishes download progress every [MinMsBetweenProgressPublish] milliseconds, until cancelled */
+    private fun CoroutineScope.launchProgressPublisher(
+        totalBytes: Long,
+        bytesDone: () -> Long,
+        onEach: () -> Unit = {},
+    ) = launch {
+        while (true) {
+            onEach()
+            publishDownloadProgress(bytesDone = bytesDone(), totalBytes = totalBytes)
+            delay(MinMsBetweenProgressPublish)
+        }
+    }
+
+    private fun failureUnsuccessfulResponse(response: Response<*>, downloadUrl: String) = Result.failure(Data.Builder().apply {
+        putInt(WorkDataDownloadFailureType, DownloadFailure.UnsuccessfulResponse.value)
+        putString(WorkDataDownloadFailureExtraUrl, downloadUrl)
+        putString(WorkDataDownloadFailureExtraFilename, updateData?.filename)
+        putString(WorkDataDownloadFailureExtraVersion, updateData?.versionNumber)
+        putString(WorkDataDownloadFailureExtraOtaVersion, updateData?.otaVersionNumber)
+        putInt(WorkDataDownloadFailureExtraHttpCode, response.code())
+        putString(WorkDataDownloadFailureExtraHttpMessage, response.message())
+    }.build())
 
     /**
      * Refreshing download links is only required for Android 16+ updates, but an SDK check is not
@@ -582,7 +695,8 @@ class DownloadWorker @AssistedInject constructor(
         }
 
         DigestInputStream(zipFile.inputStream(), digest).use { stream ->
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            // Bigger reads mean fewer (relatively expensive) FUSE calls for multi-GB files
+            val buffer = ByteArray(Md5BufferSize)
 
             return@withContext try {
                 while (stream.read(buffer, 0, buffer.size) > 0) {
@@ -700,7 +814,7 @@ class DownloadWorker @AssistedInject constructor(
     }
 
     private suspend fun handleException(
-        response: Response<ResponseBody>,
+        response: Response<*>,
         downloadUrl: String,
         exception: Exception,
     ): Result = withContext(Dispatchers.IO) {
@@ -781,7 +895,7 @@ class DownloadWorker @AssistedInject constructor(
             }
         } else {
             // Delete any associated tracker preferences to allow retrying this work with a fresh state
-            sharedPreferences.remove(KeyDownloadBytesDone)
+            sharedPreferences.remove(KeyDownloadBytesDone, KeyDownloadChunks)
 
             // Try deleting the file to allow retrying this work with a fresh state
             // Even if it doesn't get deleted, we can overwrite data to the same file
@@ -832,5 +946,6 @@ class DownloadWorker @AssistedInject constructor(
          */
         private const val ThresholdBytesDifferenceWithBackend = 1048576L
         private const val MaxRetries = 3
+        private const val Md5BufferSize = 256 * 1024
     }
 }

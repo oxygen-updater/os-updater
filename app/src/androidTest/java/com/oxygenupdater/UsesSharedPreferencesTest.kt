@@ -16,5 +16,7 @@ open class UsesSharedPreferencesTest : ComposeBaseTest() {
 
     protected fun getPrefStr(key: String, default: String) = sharedPreferences[key, default]
     protected fun getPrefBool(key: String, default: Boolean) = sharedPreferences[key, default]
+    protected fun getPrefInt(key: String, default: Int) = sharedPreferences[key, default]
     protected fun persistBool(key: String, value: Boolean) = trackCallback("persistBool: $key=$value")
+    protected fun persistInt(key: String, value: Int) = trackCallback("persistInt: $key=$value")
 }

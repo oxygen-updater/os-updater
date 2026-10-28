@@ -69,12 +69,14 @@ import com.oxygenupdater.icons.Notifications
 import com.oxygenupdater.icons.Paid
 import com.oxygenupdater.icons.Palette
 import com.oxygenupdater.icons.Policy
+import com.oxygenupdater.icons.Speed
 import com.oxygenupdater.icons.Star
 import com.oxygenupdater.icons.Symbols
 import com.oxygenupdater.icons.TrackChanges
 import com.oxygenupdater.internal.settings.KeyAdFree
 import com.oxygenupdater.internal.settings.KeyAdvancedMode
 import com.oxygenupdater.internal.settings.KeyDevice
+import com.oxygenupdater.internal.settings.KeyDownloadConnections
 import com.oxygenupdater.internal.settings.KeyShareAnalyticsAndLogs
 import com.oxygenupdater.internal.settings.KeyUpdateMethod
 import com.oxygenupdater.models.Device
@@ -90,14 +92,17 @@ import com.oxygenupdater.ui.common.rememberState
 import com.oxygenupdater.ui.currentLocale
 import com.oxygenupdater.ui.dialogs.AdvancedModeSheet
 import com.oxygenupdater.ui.dialogs.ContributorSheet
+import com.oxygenupdater.ui.dialogs.DownloadConnectionsSheet
 import com.oxygenupdater.ui.dialogs.LanguageSheet
 import com.oxygenupdater.ui.dialogs.ModalBottomSheet
 import com.oxygenupdater.ui.dialogs.SelectableSheet
 import com.oxygenupdater.ui.dialogs.ThemeSheet
+import com.oxygenupdater.ui.dialogs.downloadConnectionsTitle
 import com.oxygenupdater.ui.main.NavType
 import com.oxygenupdater.ui.theme.LocalTheme
 import com.oxygenupdater.ui.theme.PreviewAppTheme
 import com.oxygenupdater.ui.theme.PreviewGetPrefBool
+import com.oxygenupdater.ui.theme.PreviewGetPrefInt
 import com.oxygenupdater.ui.theme.PreviewGetPrefStr
 import com.oxygenupdater.ui.theme.PreviewThemes
 import com.oxygenupdater.utils.ContributorUtils
@@ -105,6 +110,7 @@ import com.oxygenupdater.utils.NotifStatus
 import com.oxygenupdater.utils.NotifUtils
 import com.oxygenupdater.utils.logInfo
 import com.oxygenupdater.utils.okHttpCache
+import com.oxygenupdater.workers.DownloadConnectionsAuto
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
@@ -125,7 +131,9 @@ fun SettingsScreen(
     openAboutScreen: () -> Unit,
     getPrefStr: (key: String, default: String) -> String,
     getPrefBool: (key: String, default: Boolean) -> Boolean,
+    getPrefInt: (key: String, default: Int) -> Int,
     persistBool: (key: String, value: Boolean) -> Unit,
+    persistInt: (key: String, value: Int) -> Unit,
 ) = Column(
     Modifier
         .verticalScroll(rememberScrollState())
@@ -174,7 +182,15 @@ fun SettingsScreen(
 
     // region Advanced
     Header(R.string.preference_header_advanced)
-    AdvancedMode(getPrefBool = getPrefBool, onChange = onAdvancedModeChange)
+
+    // Maintain state if user leaves this screen, then comes back to it
+    var advancedMode by rememberState(getPrefBool(KeyAdvancedMode, false))
+    AdvancedMode(checked = advancedMode) {
+        onAdvancedModeChange(it)
+        advancedMode = it
+    }
+    // Tester-only knob, so it's hidden behind advanced mode (which already warns the user)
+    if (advancedMode) DownloadConnections(getPrefInt = getPrefInt, persistInt = persistInt)
     SettingsAnalytics(getPrefBool = getPrefBool, persistBool = persistBool)
     PrivacyOptionsItem(
         isPrivacyOptionsRequired = isPrivacyOptionsRequired,
@@ -415,19 +431,14 @@ private fun Language() {
 
 @Composable
 private fun AdvancedMode(
-    getPrefBool: (key: String, default: Boolean) -> Boolean,
+    checked: Boolean,
     onChange: (Boolean) -> Unit,
 ) {
     var showSheet by rememberState(false)
 
-    // Maintain state if user leaves this screen, then comes back to it
-    var advancedMode by rememberState(getPrefBool(KeyAdvancedMode, false))
     SettingsSwitchItem(
-        checked = advancedMode,
-        onCheckedChange = {
-            onChange(it)
-            advancedMode = it
-        },
+        checked = checked,
+        onCheckedChange = onChange,
         icon = Symbols.LockOpen,
         titleResId = R.string.settings_advanced_mode,
         showWarning = { showSheet = true },
@@ -436,7 +447,30 @@ private fun AdvancedMode(
     if (showSheet) ModalBottomSheet({ showSheet = false }) { hide ->
         AdvancedModeSheet {
             onChange(it)
-            advancedMode = it
+            hide()
+        }
+    }
+}
+
+@Composable
+private fun DownloadConnections(
+    getPrefInt: (key: String, default: Int) -> Int,
+    persistInt: (key: String, value: Int) -> Unit,
+) {
+    var showSheet by rememberState(false)
+
+    var connections by rememberState(getPrefInt(KeyDownloadConnections, DownloadConnectionsAuto))
+    SettingsItem(
+        onClick = { showSheet = true },
+        icon = Symbols.Speed,
+        titleResId = R.string.settings_download_connections,
+        subtitle = downloadConnectionsTitle(connections),
+    )
+
+    if (showSheet) ModalBottomSheet({ showSheet = false }) { hide ->
+        DownloadConnectionsSheet(selected = connections) {
+            persistInt(KeyDownloadConnections, it)
+            connections = it
             hide()
         }
     }
@@ -694,6 +728,8 @@ fun PreviewSettingsScreen() = PreviewAppTheme {
         openAboutScreen = {},
         getPrefStr = PreviewGetPrefStr,
         getPrefBool = PreviewGetPrefBool,
+        getPrefInt = PreviewGetPrefInt,
         persistBool = { _, _ -> },
+        persistInt = { _, _ -> },
     )
 }

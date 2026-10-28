@@ -22,6 +22,10 @@ const val KeyIgnoreUnsupportedDeviceWarnings = "ignore_unsupported_device_warnin
 const val KeyIgnoreIncorrectDeviceWarnings = "ignore_incorrect_device_warnings"
 const val KeyIgnoreNotificationPermissionSheet = "ignore_notification_permission_sheet"
 const val KeyDownloadBytesDone = "download_bytes_done"
+const val KeyDownloadChunks = "download_chunks"
+
+/** Forced number of parallel download connections; `0` (default) picks automatically. Shown only in advanced mode. */
+const val KeyDownloadConnections = "download_connections"
 
 /**
  * Value cannot be changed - is from older version where it was called 'upload_logs'
